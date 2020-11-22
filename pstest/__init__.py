@@ -3,18 +3,59 @@ import re
 import time
 import socket
 import loggus
+import argparse
 
 from typing import Tuple
 
-"""
-> GET / HTTP/1.1
-> Host: www.baidu.com
-> User-Agent: curl/7.55.1
-> Accept: */*
-"""
+from threading import RLock
+
+__author__ = "https://github.com/CzaOrz"
+__version__ = "0.0.1"
 
 regex = re.compile("(?:(https?)://)?([^/]*)(.*)")
 size = 1024 * 1024
+
+
+class Collector:
+    samples = 0  # total samples.
+    errSamples = 0  # total error samples.
+    connCreateTimeMin = 0
+    sendMsgTimeMin = 0
+    resMsgTimeMin = 0
+    connCreateTimeAvg = 0
+    sendMsgTimeAvg = 0
+    resMsgTimeAvg = 0
+    connCreateTimeMax = 0
+    sendMsgTimeMax = 0
+    resMsgTimeMax = 0
+    connCreateTimeTotal = 0
+    sendMsgTimeTotal = 0
+    resMsgTimeTotal = 0
+    lock = RLock()
+
+    def record(self, connCreateTime: float, sendMsgTime: float, resMsgTime: float) -> None:
+        with self.lock:
+            self.samples += 1
+            self.connCreateTimeTotal += connCreateTime
+            self.sendMsgTimeTotal += sendMsgTime
+            self.resMsgTimeTotal += resMsgTime
+            self.connCreateTimeMin = min(connCreateTime, self.connCreateTimeMin)
+            self.sendMsgTimeMin = min(sendMsgTime, self.sendMsgTimeMin)
+            self.resMsgTimeMin = min(resMsgTime, self.resMsgTimeMin)
+            self.connCreateTimeAvg = self.connCreateTimeTotal / self.samples
+            self.sendMsgTimeAvg = self.sendMsgTimeAvg / self.samples
+            self.resMsgTimeAvg = self.resMsgTimeAvg / self.samples
+            self.connCreateTimeMax = max(connCreateTime, self.connCreateTimeMax)
+            self.sendMsgTimeMax = max(sendMsgTime, self.sendMsgTimeMax)
+            self.resMsgTimeMax = max(resMsgTime, self.resMsgTimeMax)
+
+    def recordWithErr(self, connCreateTime: float, sendMsgTime: float, resMsgTime: float) -> None:
+        with self.lock:
+            self.errSamples += 1
+            self.record(connCreateTime, sendMsgTime, resMsgTime)
+
+
+collector = Collector()
 
 
 def parseUrl(url: str) -> Tuple[str, str, int, str]:
@@ -33,33 +74,23 @@ def parseUrl(url: str) -> Tuple[str, str, int, str]:
     return host, hostIP, port, path
 
 
-def request(address: Tuple[str, int], requestMsg: bytes, timeout: int = None) -> Tuple[int, bytes, float, float, float]:
-    # sock = socket.create_connection(address, timeout)
-    sock = socket.socket()
-    sock.settimeout(timeout) if timeout else None
-
-    start = time.monotonic()
-    sock.connect(address)
-
-    connCreateTime = time.monotonic() - start
-
-    start = time.monotonic()
-    sock.send(requestMsg)
-    sendMsgTime = time.monotonic() - start
-
-    start = time.monotonic()
-    response = sock.recv(size)
-    recvMsgTime = time.monotonic() - start
-    sock.close()
-    del sock
-
+def parseResponse(response: bytes) -> Tuple[int, dict, bytes]:
     statusIndex = response.find(b" ") + 1
-    status = int(response[statusIndex:statusIndex + 3])
+    statusIndexEnd = statusIndex + 3
+    status = int(response[statusIndex:statusIndexEnd])
 
-    bodyIndex = response.find(b"\r\n\r\n") + 4
+    headersIndex = response.find(b"\r\n", statusIndexEnd) + 2
+    headersEnd = response.find(b"\r\n\r\n", headersIndex)
+    bodyIndex = headersEnd + 4
+    headersBytes = response[headersIndex:headersEnd]
     body = response[bodyIndex:]
 
-    return status, body, connCreateTime, sendMsgTime, recvMsgTime
+    headers = {}
+    for header in headersBytes.decode("utf-8").split("\r\n"):
+        kv = header.split(":")
+        if len(kv) == 2:
+            headers[kv[0].strip()] = kv[1].strip()
+    return status, headers, body
 
 
 def parseRequestInfo(method: str, url: str, headers: dict = None, body: str = None) -> Tuple[str, int, bytes]:
@@ -68,38 +99,57 @@ def parseRequestInfo(method: str, url: str, headers: dict = None, body: str = No
     requestMsg = f"{method} {path} HTTP/1.1\r\n"
     headersBases = {
         "Host": host,
-        "User-Agent": "PyStressTest/0.0.1",
+        "User-Agent": f"PyStressTest/{__version__}",
         "Accept": "*/*",
-        "Content-Length": 0,
     }
-    headersBases.update(headers or {})
-    body = (body or "").encode("utf-8")
-    headersBases.update({"Content-Length": len(body)})
+    if body:
+        body = body.encode("utf-8")
+        headersBases["Content-Length"] = len(body)
+        headersBases["Content-Type"] = "application/x-www-form-urlencoded"
+    if headers:
+        headersBases.update(headers)
     for key, value in headersBases.items():
         requestMsg += f"{key}: {value}\r\n"
-    requestMsg += "\r\n"
-    requestMsg = requestMsg.encode("utf-8") + body
+    else:
+        requestMsg += "\r\n"
+    requestMsg = requestMsg.encode("utf-8")
+    if body:
+        requestMsg = requestMsg + body
 
     return hostIP, port, requestMsg
 
 
-# def test():
-#     import json
-#     method = "POST"
-#     url = "http://fxcse.avlyun.com/v2/search/pro"
-#     headers = {"Content-Type": "application/json"}
-#     body = json.dumps(
-#         {"appId": "26de60ca3b194f71f550815882105423", "timeStamp": 1596437077, "apiVersion": "2.0", "uuid": "",
-#          "scanScene": "0", "secret": "5600ce7a0c2aa9df1c2d19f1f72e41ba", "searchInfo": [
-#             {"apkMd5": "FFE9548E5725EFD13AB5E50E2E68E78F", "packageName": "xpt.com.qmkd", "programName": "全民看点",
-#              "keyHash": "004410b3c22a9dc4", "mfMd5": "EA007289208D93B465C55F66710D84FE", "index": "1"}]})
-#     hostIP, port, requestMsg = parseRequestInfo(method, url, headers, body)
-#     for _ in range(5):
-#         print(request((hostIP, port), requestMsg))
-count = 0
-connCreateTimeMax = 0
-sendMsgTimeMax = 0
-recvMsgTimeMax = 0
+def request(address: Tuple[str, int], requestMsg: bytes, timeout: int = None) -> Tuple[bytes, float, float, float]:
+    sock = socket.socket()
+    sock.settimeout(timeout) if timeout else None
+
+    start = time.monotonic()
+    sock.connect(address)
+    connCreateTime = time.monotonic() - start
+
+    start = time.monotonic()
+    sock.send(requestMsg)
+    sendMsgTime = time.monotonic() - start
+
+    start = time.monotonic()
+    response = b""
+    # print(sock.recv(0))
+    # respo = []
+    # import io
+    # respo = bytearray(1024)
+    # print(sock.recv_into(respo, 1024))
+    # print(respo)
+    # response = respo
+    response = sock.recv(size)
+    # sock.setblocking(False)
+    # while chunk:
+    #     print(chunk)
+    #     response += chunk
+    #     chunk = sock.recv(size)
+    recvMsgTime = time.monotonic() - start
+
+    sock.close()
+    return response, connCreateTime, sendMsgTime, recvMsgTime
 
 
 def ttt():
@@ -133,37 +183,64 @@ def ttt():
     [t.join() for t in ts]
 
 
-if __name__ == '__main__':
-    ttt()
-    # import json
-    # hostIP, port, requestMsg = parseRequestInfo("POST", "http://10.251.63.35:8400/callback",
-    #                                             {"Content-Type": "application/json"}, json.dumps({"name": "cc"}))
-    # while True:
-    #     # import requests
-    #     # print(requests.post("http://10.251.63.35:8400/callback", json={"name": "cc"}).content)
-    #     status, body, connCreateTime, sendMsgTime, recvMsgTime = request((hostIP, port), requestMsg, 4)
-    #     count += 1
-    #     connCreateTimeMax = max(connCreateTimeMax, connCreateTime)
-    #     sendMsgTimeMax = max(sendMsgTimeMax, sendMsgTime)
-    #     recvMsgTimeMax = max(recvMsgTimeMax, recvMsgTime)
-    #     loggus.WithFields({
-    #         "status": status,
-    #         "connCreateTime": connCreateTimeMax,
-    #         "sendMsgTime": sendMsgTimeMax,
-    #         "recvMsgTime": recvMsgTimeMax,
-    #     }).info("ok")
+def test():
+    hostIP, port, requestMsg = parseRequestInfo("POST", "www.baidu.com",
+                                                {"Content-Type": "application/json"})
+    status, body, connCreateTime, sendMsgTime, recvMsgTime = request((hostIP, port), requestMsg, 4)
+    print(status, body, connCreateTime, sendMsgTime, recvMsgTime)
 
-# if __name__ == '__main__':
-#     print(socket.gethostbyname("www.baidu.com"))
-#     print(socket.gethostbyname_ex("www.baidu.com"))
-#     print(socket.gethostbyname("fxcse.avlyun.com"))
-#     print(socket.gethostbyname_ex("fxcse.avlyun.com"))
-#     print(socket.gethostbyname("14.215.177.38"))
-#     print(socket.gethostbyname_ex("14.215.177.38"))
-#
-#     for url in ["www.baidu.com", "http://www.baidu.com/", "https://www.baidu.com/callback?args=1",
-#                 "http://localhost:8080/callback"]:
-#         # print(regex.search(url).groups(), parseUrl(url))
-#         parseRequestInfo("GET", url)
-#
-#     test()
+
+def execute(args: list = None) -> None:
+    parser = argparse.ArgumentParser(
+        prog="PyStressTest",
+        description="a easy stress test tools.",
+    )
+
+    parser.add_argument("-X", help="request method. default is `GET`, if request with data, default `POST`.")
+    parser.add_argument("-H", action='append', help="header to server, format like <key:value>", default=[])
+    parser.add_argument("-d", action='append', help="http body data.", default=[])
+    parser.add_argument("-v", action='store_true', help="make the operation more talkative.")
+    parser.add_argument("--stress", action='store_true', help="open stress test.")
+    parser.add_argument("--timeout", help="connect timeout.", type=int, default=8)
+    parser.add_argument("uri", help="the resource identifier.")
+
+    args = parser.parse_args(args)
+
+    method = args.X.upper() if args.X else "GET"
+    headers = {}
+    for header in args.H:
+        kv = header.split(":", 1)
+        if len(kv) == 2:
+            headers[kv[0].strip()] = kv[1].strip()
+    body = "".join(args.d)
+    timeout = args.timeout
+
+    try:
+        hostIP, port, requestMsg = parseRequestInfo(method, args.uri, headers, body)
+    except Exception as e:
+        loggus.WithTraceback().panic(e)
+        return
+
+    try:
+        response, connCreateTime, sendMsgTime, recvMsgTime = request((hostIP, port), requestMsg, timeout)
+        status, headers, body = parseResponse(response)
+    except Exception as e:
+        loggus.WithTraceback().panic(e)
+        return
+
+    loggus.WithFields(headers).info("ResponseHeaders")
+    if status < 300:
+        loggus.WithField("ResponseBody", body.decode("utf-8"), loggus.INFO_COLOR).info(status)
+    elif status < 400:
+        loggus.WithField("ResponseBody", body.decode("utf-8"), loggus.WARNING_COLOR).warning(status)
+    else:
+        loggus.WithField("ResponseBody", body.decode("utf-8"), loggus.ERROR_COLOR).error(status)
+    loggus.WithFields({
+        "connCreateTime": connCreateTime,
+        "sendMsgTime": sendMsgTime,
+        "recvMsgTime": recvMsgTime,
+    }).info("PerformanceShow")
+
+
+if __name__ == '__main__':
+    execute(["http://fanyi.youdao.com/"])
